@@ -1,0 +1,17 @@
+{
+    "kunde": "Rau Systemberatung GmbH",
+    "proxy": "",
+    "drucker": [{
+        "ip": "10.100.20.110",
+        "variant": "xerox",
+        "desc": "2. OG | Marketing"
+    }, {
+        "ip": "10.100.20.110",
+        "variant": "xeroxbw",
+        "desc": "1. OG | Empfang"
+    }, {
+        "ip": "192.168.22.21",
+        "variant": "xerox",
+        "desc": "5. OG | Zentrale"
+    }]
+}
