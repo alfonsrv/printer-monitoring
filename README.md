@@ -21,9 +21,9 @@ Edit the configuration file `printer_config.txt` (JSON) and edit the desired pri
 3. `token`: Token to authenticate data report against the backend
 4. `printers`: List of all configured printers to query and monitor
     1. `ip`: IP address of the target printer
-    2. `variant`:Most important setting for getting accurate data. This describes a printer's type to map the relevant OIDs for querying (see [**Variants**](#variants-📇))
-    3. `serial`:
-    3. ```desc``` - used for describing and identifying a printer, e.g. where it is
+    2. `variant`: Most important setting for getting accurate data. This describes a printer's type to map the relevant OIDs for querying (see [**Variants**](#variants-))
+    3. `serial`: Fallback serial number for clear identification, since OID evaluation can be unreliable
+    3. `description`: Optional description to identify a printer, e.g. by indicating its location
 5. Test your configuration and accurate data output using `python Printer-Monitoring.py --debug`
 
 To deploy and run regularly use *cron* or *Windows Task Scheduler*.
@@ -63,3 +63,9 @@ docker build -t printermonitoring . \
 This allows running the script on e.g. 
 Alternatively consider using `docker-compose`
 
+
+## Backend Sample
+
+Example on what a tracking backend could look like. Storing historic printer data, indicating last consumables change, last report timestamp and showing the current state of the printer in a central dashboard
+
+[<img src="sample-backend.jpg">](#)
