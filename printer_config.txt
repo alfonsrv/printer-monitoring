@@ -1,17 +1,21 @@
 {
-    "kunde": "Rau Systemberatung GmbH",
-    "proxy": "",
-    "drucker": [{
+    "client": "Rau Systemberatung GmbH",
+    "token": "<auth-token-here>",
+    "proxy": "127.0.0.1:3128",
+    "printers": [{
         "ip": "10.100.20.110",
+        "serial": "1337420",
         "variant": "xerox",
-        "desc": "2. OG | Marketing"
+        "description": "2. OG | Marketing"
     }, {
         "ip": "10.100.20.110",
+        "serial": "1337420",
         "variant": "xeroxbw",
-        "desc": "1. OG | Empfang"
+        "description": "1. OG | Empfang"
     }, {
         "ip": "192.168.22.21",
+        "serial": "1337420",
         "variant": "xerox",
-        "desc": "5. OG | Zentrale"
+        "description": "5. OG | Zentrale"
     }]
 }

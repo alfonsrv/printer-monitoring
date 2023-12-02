@@ -17,744 +17,1121 @@ Values:
 	[!] -404 Timeout
 	[!] -401 Unhandled Exception
 
-Requirements:
-	pip3 install pysnmp requests
-
-Config:
-	{
-		"kunde": "Client Name",
-		"proxy": "",
-		"drucker": [{
-			"ip": "10.100.20.110",
-			"variant": "xerox",
-			"desc": "2. OG | Marketing"
-		}, {
-			"ip": "10.100.20.110",
-			"variant": "xeroxbw",
-			"desc": "1. OG | Empfang"
-		}, {
-			"ip": "192.168.22.21",
-			"variant": "xerox",
-			"desc": "5. OG | Zentrale"
-		}]
-	}
 """
 
-__author__ = 'github/alfonsrv'
-__version__ = '0.3'
-__python__ = '3.7'
+__author__ = 'Rau Systemberatung GmbH, 2024'
+__copyright__ = '(c) Rau Systemberatung GmbH, 2024'
+__version__ = '1.30'
+__email__ = 'info@rausys.de'
+__python__ = '3.x'
 __service__ = 'PrinterMonitoring'
 
 
 from pysnmp.entity.rfc3413.oneliner import cmdgen
 from pysnmp.proto import rfc1905
-from datetime import datetime
-import sys, traceback
-import requests, json, os
+from datetime import datetime, timezone
+import argparse
+import requests
+import json
 
-BACKEND = 'https://domain.tld/printer.php'
+import os
+from enum import Enum
+import logging
+import logging.handlers
+
+
+BACKEND = 'https://sys.rau.biz/api/printer/'
 HEADERS = {
-			'Authentication': '4uth0rizedPr1nterz#',
-			'Content-Type': 'application/json; charset=utf-8',
-		}
-PROXIES = {
-			'http':'',
-			'https':'',
+    'Authentication': '1337Auth0rizedPrinterz#',
+    'Content-Type': 'application/json; charset=utf-8',
+    'User-Agent': f'RAUSYS Automation - Printers {__version__}',
 }
-LOGFILE = 'Printer-Monitoring.log'
+PROXIES = {
+    'http':'',
+    'https':'',
+}
+
+os.chdir(os.path.realpath(os.path.join(os.getcwd(), os.path.dirname(__file__))))
+LOG_LEVEL = logging.INFO  # logging.DEBUG // .ERROR...
+LOG_FILE = 'RauSys-Monitoring.log'
+LOG_PATH = os.path.join(os.getcwd(), LOG_FILE)
+logging.basicConfig(
+    format='%(asctime)s - [%(levelname)s] %(message)s',
+    level=LOG_LEVEL,
+    handlers=[
+        logging.StreamHandler(),
+        logging.handlers.RotatingFileHandler(
+            LOG_PATH,
+            maxBytes=5000000,   # 10 MB
+            backupCount=3
+        )
+    ]
+)
+
+logger = logging.getLogger(__name__)
 
 
-def override(f):
-	'''
-	Tut nichts; existiert nur, damit man @override
-	für Dokumentationszwecke nutzen kann.
-	'''
-	return f
+class PrinterConsumable():
+    """ Hilfsklasse für Drucker Verbrauchsmaterialien """
+
+    class Consumable(Enum):
+        FUSER = 'FUSER'
+        CLEANER = 'CLEANER'
+        TRANSFER = 'TRANSFER'
+        WASTE = 'WASTE'
+        BLACK_TONER = 'BLACK_TONER'
+        CYAN_TONER = 'CYAN_TONER'
+        MAGENTA_TONER = 'MAGENTA_TONER'
+        YELLOW_TONER = 'YELLOW_TONER'
+        BLACK_DRUM = 'BLACK_DRUM'
+        CYAN_DRUM = 'CYAN_DRUM'
+        MAGENTA_DRUM = 'MAGENTA_DRUM'
+        YELLOW_DRUM = 'YELLOW_DRUM'
+
+    def __init__(self, name, capacity, remaining, type):
+        logger.debug(f'|--> {type} {name}')
+        self.name = name
+        self.capacity = int(capacity) if capacity and capacity.isdigit() else None
+        self.remaining = int(remaining) if isinstance(remaining, str) and remaining.isdigit() else None  # can be 0
+        self.type = type.value
+        if not self.initialized: logger.warning(f'{self} did not initialize properly!')
+
+    def __str__(self) -> str:
+        if not self.initialized: return f'[{self.type}] – no data –'
+        return f'[{self.type}] {self.name} ({self.remaining}/{self.capacity}) {self.percentage}%'
+
+    @property
+    def percentage(self) -> int:
+        if self.remaining is None or self.capacity is None: return None
+        z = self.remaining / self.capacity
+        if z > 1 or z < 0:
+            z = self.capacity / self.remaining
+        return int(round(z,2)*100)
+
+    @property
+    def initialized(self):
+        """ Hilfsfunktion um zu evaluieren, ob Consumable vollständig
+        initialisiert wurde oder nicht """
+        return self.capacity
+
 
 class Printer():
-	oid_printerName = '1.3.6.1.2.1.1.5.0'
-	oid_printerModel = '1.3.6.1.2.1.25.3.2.1.3.1'
-	oid_printerMeta = '1.3.6.1.2.1.1.1.0'
-	# alternativ 1.3.6.1.4.1.2699.1.2.1.2.1.1.3.1
-	# alternativ2 1.3.6.1.2.1.1.1.0
-	oid_printerSerial = '1.3.6.1.2.1.43.5.1.1.17.1'
-	# alternativ SN: 1.3.6.1.4.1.253.8.53.3.2.1.3.1
+    oid_printer_name = '1.3.6.1.2.1.1.5.0'
+    oid_printer_model = '1.3.6.1.2.1.25.3.2.1.3.1'
+    oid_printer_meta = '1.3.6.1.2.1.1.1.0'
+    # alternativ 1.3.6.1.4.1.2699.1.2.1.2.1.1.3.1
+    # alternativ2 1.3.6.1.2.1.1.1.0
+    oid_printer_serial = '1.3.6.1.2.1.43.5.1.1.17.1'
+    # alternativ SN: 1.3.6.1.4.1.253.8.53.3.2.1.3.1
 
-	# Usage/Prints Details
-	oid_printsOverall = '1.3.6.1.4.1.253.8.53.13.2.1.6.1.20.1'
-	oid_printsColor = '1.3.6.1.4.1.253.8.53.13.2.1.6.1.20.33'
-	oid_printsMonochrome = '1.3.6.1.4.1.253.8.53.13.2.1.6.1.20.34'
+    # Usage/Prints Details
+    oid_print_count = '1.3.6.1.4.1.253.8.53.13.2.1.6.1.20.1'
+    oid_print_color = '1.3.6.1.4.1.253.8.53.13.2.1.6.1.20.33'
+    oid_print_mono = '1.3.6.1.4.1.253.8.53.13.2.1.6.1.20.34'
 
-	# Bildtransferkit
-	oid_fuserType = '1.3.6.1.2.1.43.11.1.1.6.1.9'
-	oid_fuserCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.9'
-	oid_fuserRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.9'
-	
-	# Resttonbehälter
-	oid_wasteType = '1.3.6.1.2.1.43.11.1.1.6.1.10'
-	oid_wasteCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.10'
-	oid_wasteRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.10'
-	
-	# Walzenkit
-	oid_cleanerType = '1.3.6.1.2.1.43.11.1.1.6.1.11'
-	oid_cleanerCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.11'
-	oid_cleanerRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.11'
-	
-	# Vorlageneinzugskit
-	oid_transferType = '1.3.6.1.2.1.43.11.1.1.6.1.12'
-	oid_transferCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.12'
-	oid_transferRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.12'
+    # Fixiereinheit/Fuser Kit
+    oid_fuser_name = '1.3.6.1.2.1.43.11.1.1.6.1.9'
+    oid_fuser_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.9'
+    oid_fuser_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.9'
 
+    # Resttonbehälter/Waste Cartridge
+    oid_waste_name = '1.3.6.1.2.1.43.11.1.1.6.1.10'
+    oid_waste_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.10'
+    oid_waste_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.10'
 
-	## Toner ##########
-	oid_blackTonerType = '1.3.6.1.2.1.43.11.1.1.6.1.1'
-	oid_blackTonerCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.1'
-	oid_blackTonerRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.1'
+    # Bandreiniger/Transfer Belt Cleaner Kit
+    oid_cleaner_name = '1.3.6.1.2.1.43.11.1.1.6.1.11'
+    oid_cleaner_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.11'
+    oid_cleaner_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.11'
 
-	oid_cyanTonerType = '1.3.6.1.2.1.43.11.1.1.6.1.2'
-	oid_cyanTonerCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.2'
-	oid_cyanTonerRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.2'
-	
-	oid_magentaTonerType = '1.3.6.1.2.1.43.11.1.1.6.1.3'
-	oid_magentaTonerCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.3'
-	oid_magentaTonerRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.3'
+    # Transferrolle/Transfer Roller
+    oid_transfer_name = '1.3.6.1.2.1.43.11.1.1.6.1.12'
+    oid_transfer_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.12'
+    oid_transfer_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.12'
 
-	oid_yellowTonerType = '1.3.6.1.2.1.43.11.1.1.6.1.4'
-	oid_yellowTonerCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.4'
-	oid_yellowTonerRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.4'
+    ## Toner ##########
+    oid_black_toner_name = '1.3.6.1.2.1.43.11.1.1.6.1.1'
+    oid_black_toner_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.1'
+    oid_black_toner_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.1'
 
-	## Bildtrommel ##########
-	oid_blackDrumType = '1.3.6.1.2.1.43.11.1.1.6.1.5'
-	oid_blackDrumCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.5'
-	oid_blackDrumRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.5'
+    oid_cyan_toner_name = '1.3.6.1.2.1.43.11.1.1.6.1.2'
+    oid_cyan_toner_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.2'
+    oid_cyan_toner_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.2'
 
-	oid_cyanDrumType = '1.3.6.1.2.1.43.11.1.1.6.1.6'
-	oid_cyanDrumCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.6'
-	oid_cyanDrumRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.6'
-	
-	oid_magentaDrumType = '1.3.6.1.2.1.43.11.1.1.6.1.7'
-	oid_magentaDrumCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.7'
-	oid_magentaDrumRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.7'
-	
-	oid_yellowDrumType = '1.3.6.1.2.1.43.11.1.1.6.1.8'
-	oid_yellowDrumCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.8'
-	oid_yellowDrumRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.8'
-	
+    oid_magenta_toner_name = '1.3.6.1.2.1.43.11.1.1.6.1.3'
+    oid_magenta_toner_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.3'
+    oid_magenta_toner_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.3'
 
-	def __init__(self, ip, variant, beschreibung, kunde, port=161, community='public'):
+    oid_yellow_toner_name = '1.3.6.1.2.1.43.11.1.1.6.1.4'
+    oid_yellow_toner_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.4'
+    oid_yellow_toner_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.4'
 
-		self.ip = ip
-		self.kunde = kunde
-		self.desc = beschreibung
-		self.variant = type(self).__name__
-		
-		self.port = port
-		self.community = community
-		self.variant = variant.lower()
-		self.name = -401
-		self.version = __version__
+    ## Bildtrommel ##########
+    oid_black_drum_name = '1.3.6.1.2.1.43.11.1.1.6.1.5'
+    oid_black_drum_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.5'
+    oid_black_drum_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.5'
 
-	def initializeValues(self):
-		#if(self.ping()):
-		writeLog('[>] Initialisiere Drucker %s [%s]...' % (self.desc, self.ip))
-		self.name = self.getSnmp(self.oid_printerName)
-		self.model = self.getSnmp(self.oid_printerModel)
-		self.serial = self.getSnmp(self.oid_printerSerial)
-		self.meta = self.getSnmp(self.oid_printerMeta)
+    oid_cyan_drum_name = '1.3.6.1.2.1.43.11.1.1.6.1.6'
+    oid_cyan_drum_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.6'
+    oid_cyan_drum_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.6'
 
-		self.printsOverall = self.getSnmp(self.oid_printsOverall)
-		self.printsColor = self.getSnmp(self.oid_printsColor)
-		self.printsMonochrome = self.getSnmp(self.oid_printsMonochrome)
-		
-		self.fuserType = self.getSnmp(self.oid_fuserType)
-		self.fuserCapacity = self.getSnmp(self.oid_fuserCapacity)
-		self.fuserRemaining = self.getSnmp(self.oid_fuserRemaining)
+    oid_magenta_drum_name = '1.3.6.1.2.1.43.11.1.1.6.1.7'
+    oid_magenta_drum_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.7'
+    oid_magenta_drum_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.7'
 
-		self.wasteType = self.getSnmp(self.oid_wasteType)
-		self.wasteCapacity = self.getSnmp(self.oid_wasteCapacity)
-		self.wasteRemaining = self.getSnmp(self.oid_wasteRemaining)
+    oid_yellow_drum_name = '1.3.6.1.2.1.43.11.1.1.6.1.8'
+    oid_yellow_drum_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.8'
+    oid_yellow_drum_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.8'
 
-		self.cleanerType = self.getSnmp(self.oid_cleanerType)
-		self.cleanerCapacity = self.getSnmp(self.oid_cleanerCapacity)
-		self.cleanerRemaining = self.getSnmp(self.oid_cleanerRemaining)
+    def __init__(self, ip, description, kunde, serial, *args, port=161, community='public', **kwargs):
+        self.ip = ip
+        self.kunde = kunde
+        self.serial = serial
+        self.description = description
+        self.variant = type(self).__name__.lower()
 
-		self.transferType = self.getSnmp(self.oid_transferType)
-		self.transferCapacity = self.getSnmp(self.oid_transferCapacity)
-		self.transferRemaining = self.getSnmp(self.oid_transferRemaining)
+        self.port = port
+        self.community = community
+        self.version = __version__
+        self.status = 'ERROR'
+        self.status = 'OK' if self.ping() else 'TIMEOUT'
 
-		self.blackTonerType = self.getSnmp(self.oid_blackTonerType)
-		self.blackTonerCapacity = self.getSnmp(self.oid_blackTonerCapacity)
-		self.blackTonerRemaining = self.getSnmp(self.oid_blackTonerRemaining)
+    def to_json(self) -> dict:
+        x = self.__dict__
+        consumables = x.pop('consumables', list())
+        x['consumables'] = list()
+        for consumable in consumables:
+            x['consumables'].append(consumable.__dict__)
+        return x
 
-		self.cyanTonerType = self.getSnmp(self.oid_cyanTonerType)
-		self.cyanTonerCapacity = self.getSnmp(self.oid_cyanTonerCapacity)
-		self.cyanTonerRemaining = self.getSnmp(self.oid_cyanTonerRemaining)
+    def initialize_values(self):
+        logger.info(f'[>] Initialisiere Drucker {self.description} [{self.ip}]...')
+        self.name = self.query_snmp(self.oid_printer_name)
+        self.model = self.query_snmp(self.oid_printer_model)
+        #self.serial = self.query_snmp(self.oid_printer_serial)
+        self.meta = self.query_snmp(self.oid_printer_meta)
 
-		self.magentaTonerType = self.getSnmp(self.oid_magentaTonerType)
-		self.magentaTonerCapacity = self.getSnmp(self.oid_magentaTonerCapacity)
-		self.magentaTonerRemaining = self.getSnmp(self.oid_magentaTonerRemaining)
+        self.print_count = self.query_snmp(self.oid_print_count)
+        self.print_color = self.query_snmp(self.oid_print_color)
+        self.print_mono = self.query_snmp(self.oid_print_mono)
 
-		self.yellowTonerType = self.getSnmp(self.oid_yellowTonerType)
-		self.yellowTonerCapacity = self.getSnmp(self.oid_yellowTonerCapacity)
-		self.yellowTonerRemaining = self.getSnmp(self.oid_yellowTonerRemaining)
+        # Fallback um print_count vollständig zu initialisieren
+        if not self.print_count:
+            self.print_count = (self.print_color or 0) + (self.print_mono or 0)
+            if not self.print_count: self.print_count = None
 
-		self.blackDrumType = self.getSnmp(self.oid_blackDrumType)
-		self.blackDrumCapacity = self.getSnmp(self.oid_blackDrumCapacity)
-		self.blackDrumRemaining = self.getSnmp(self.oid_blackDrumRemaining)
+        self.consumables = []
 
-		self.cyanDrumType = self.getSnmp(self.oid_cyanDrumType)
-		self.cyanDrumCapacity = self.getSnmp(self.oid_cyanDrumCapacity)
-		self.cyanDrumRemaining = self.getSnmp(self.oid_cyanDrumRemaining)
+        for consumable in PrinterConsumable.Consumable:
+            # wenn oid_<consumable>_capacity gesetzt ist (also falls Variable vorhanden und
+            # mit Wert belegt ist), initialisieren
+            if getattr(self, f'oid_{consumable.value.lower()}_capacity'):
+                logger.debug(f'Detected {consumable.value} as being present in OIDs')
+                oid_name = getattr(self, f'oid_{consumable.value.lower()}_name')
+                oid_capacity = getattr(self, f'oid_{consumable.value.lower()}_capacity')
+                oid_remaining = getattr(self, f'oid_{consumable.value.lower()}_remaining')
+                consumable_instance = PrinterConsumable(
+                    name=self.query_snmp(oid_name),
+                    capacity=self.query_snmp(oid_capacity),
+                    remaining=self.query_snmp(oid_remaining),
+                    type=consumable
+                )
 
-		self.magentaDrumType = self.getSnmp(self.oid_magentaDrumType)
-		self.magentaDrumCapacity = self.getSnmp(self.oid_magentaDrumCapacity)
-		self.magentaDrumRemaining = self.getSnmp(self.oid_magentaDrumRemaining)
-		
-		self.yellowDrumType = self.getSnmp(self.oid_yellowDrumType)
-		self.yellowDrumCapacity = self.getSnmp(self.oid_yellowDrumCapacity)
-		self.yellowDrumRemaining = self.getSnmp(self.oid_yellowDrumRemaining)
+                if consumable_instance.initialized: self.consumables.append(consumable_instance)
 
-		'''
-		self.cyanToner = self.getToner('c')
-		self.magentaToner = self.getToner('m')
-		self.yellowToner = self.getToner('y')
-		self.blackToner = self.getToner('k')
+    def ping(self) -> bool:
+        if self.query_snmp(self.oid_printer_name):
+            logger.info(f'[>] Drucker online, {self.description} [{self.ip}]')
+            return True
+        logger.error(f'Drucker nicht erreichbar oder "oid_printer_name" nicht auflösbar, {self.description} [{self.ip}]')
+        return False
 
-		self.cyanDrum = self.getDrum('c')
-		self.magentaDrum = self.getDrum('m')
-		self.yellowDrum = self.getDrum('y')
-		self.blackDrum = self.getDrum('k')
+    def query_snmp(self, oid: str):
+        """ SNMP Abfrage für angegebene OID """
 
-		self.fuser = self.getMisc('fuser')
-		self.cleaner = self.getMisc('cleaner')
-		self.waste = self.getMisc('waste')
-		self.transfer = self.getMisc('transfer')
-		writeLog('[>] OK. Alle Werte initialisiert.')
-		'''
+        if self.status == 'TIMEOUT': return None
+        if not oid: return None
 
-	def getToner(self, color):
-		'''
-			Hilfsfunktion ausrechnen % Werte Toner
-		'''
-		color = color.lower()
-		if(color == 'c'):
-			remaining = self.cyanTonerRemaining
-			capacity = self.cyanTonerCapacity
-		if(color == 'm'):
-			remaining = self.magentaTonerRemaining
-			capacity = self.magentaTonerCapacity
-		if(color == 'y'):
-			remaining = self.yellowTonerRemaining
-			capacity = self.yellowTonerCapacity
-		if(color == 'k'):
-			remaining = self.blackTonerRemaining
-			capacity = self.blackTonerCapacity
-		try:
-			if(remaining == -1 or capacity == -1):
-				return -1
-			if(remaining == -404 or capacity == -404):
-				return -404
-			if(remaining == -401 or capacity == -401):
-				return -401
-			return int(round((int(remaining) / int(capacity)) * 100))
-		except:
-			return -1
+        logger.debug(f'Querying {oid}...')
+        cmdGen = cmdgen.CommandGenerator()
+        error_indicator, error_status, error_index, binds = cmdGen.getCmd(
+            #cmdgen.CommunityData(self.community, mpModel=0),
+            cmdgen.CommunityData(self.community),
+            cmdgen.UdpTransportTarget((self.ip, self.port)), oid)
 
+        # Check for errors and print out results
+        if error_indicator:
+            logger.error(f'{error_indicator} for {self.ip}')
+            return None
 
-	def getDrum(self, color):
-		'''
-			Hilfsfunktion ausrechnen % Werte Bildtrommel
-		'''
-		color = color.lower()
-		if(color == 'c'):
-			remaining = self.cyanDrumRemaining
-			capacity = self.cyanDrumCapacity
-		if(color == 'm'):
-			remaining = self.magentaDrumRemaining
-			capacity = self.magentaDrumCapacity
-		if(color == 'y'):
-			remaining = self.yellowDrumRemaining
-			capacity = self.yellowDrumCapacity
-		if(color == 'k'):
-			remaining = self.blackDrumRemaining
-			capacity = self.blackDrumCapacity
-		try:
-			if(remaining == -1 or capacity == -1):
-				return -1
-			if(remaining == -404 or capacity == -404):
-				return -404
-			if(remaining == -401 or capacity == -401):
-				return -401
-			return int(round((int(remaining) / int(capacity)) * 100))
-		except:
-			return -1
-	
-	def getMisc(self, what):
-		'''
-			Hilfsfunktion ausrechnen % Werte verschiedener Subteile
-		'''
-		what = what.lower()
-		if(what == 'fuser'):
-			remaining = self.fuserRemaining
-			capacity = self.fuserCapacity
-		if(what == 'cleaner'):
-			remaining = self.cleanerRemaining
-			capacity = self.cleanerCapacity
-		if(what == 'waste'):
-			remaining = self.wasteRemaining
-			capacity = self.wasteCapacity
-		if(what == 'transfer'):
-			remaining = self.transferRemaining
-			capacity = self.transferCapacity
-		try:
-			if(remaining == -1 or capacity == -1):
-				return -1
-			if(remaining == -404 or capacity == -404):
-				return -404
-			if(remaining == -401 or capacity == -401):
-				return -401
-			return int(round((int(remaining) / int(capacity)) * 100))
-		except:
-			return -1
+        elif error_status:
+            logger.error(f'{error_status} at {error_index and binds[int(error_index)-1] or "?"}')
+            return None
 
+        for name, val in binds:
+            logger.debug(f'{name} = {val}')
+            # Evaluiert, ob kein Wert an OID; kein Wert an OID = -1
+            if val is None or isinstance(val, rfc1905.NoSuchInstance) or isinstance(val, rfc1905.NoSuchObject):
+                logger.debug(f'No OID such object!...')
+                return None
+            logger.debug(f'Returning OID value: {val}')
+            return str(val).rstrip('\x00')
 
-	def ping(self):
-		if(self.getSnmp(self.oid_printerName) != -404):
-			writeLog('[>] Drucker online, %s [%s]' % (self.desc, self.ip))
-			return True
-		else:
-			writeLog('[ERROR] Drucker nicht erreichbar, %s [%s]' % (self.desc, self.ip))
-			return False
+    def get_consumable(self, name: str) -> PrinterConsumable:
+        """ Hilfsfunktion um Consumable zurückzugeben """
+        for consumable in self.consumables:
+            if consumable.type.lower() == name.lower():
+                return consumable
+        return '- nicht konfiguriert -'
 
-
-	def printStatus(self):
-		'''
-			Konsolendarstellung 
-		'''
-		print('########## Bericht für %s ##########' % self.desc)
-		print('[i] Druckerübersicht')
-		print(' |-- Name: %s' % self.name)
-		print(' |-- Modell: %s' % self.model)
-		print(' |-- IP-Adresse: %s' % self.ip)
-		print(' |-- Seriennummer: %s' % self.serial)
-		print(' |-- Kunde: %s' % self.kunde)
-		print(' |-- Beschreibung: %s' % self.desc)
-		print('[i] Druckstatistik')
-		print(' |-- Mono: %s' % format(int(self.printsMonochrome),',d').replace(',','.'))
-		print(' |-- Farbe: %s' % format(int(self.printsColor),',d').replace(',','.'))
-		print(' |-- Total: %s' % format(int(self.printsOverall),',d').replace(',','.'))
-		print('[i] Tonerwerte')
-		print(' |-- [C] %d%%' % self.getToner('c')) 
-		print(' |-- [M] %d%%' % self.getToner('m'))
-		print(' |-- [Y] %d%%' % self.getToner('y'))
-		print(' |-- [K] %d%%' % self.getToner('k'))
-		print('[i] Bildtrommelwerte')
-		print(' |-- [C] %d%%' % self.getDrum('c')) 
-		print(' |-- [M] %d%%' % self.getDrum('m'))
-		print(' |-- [Y] %d%%' % self.getDrum('y'))
-		print(' |-- [K] %d%%' % self.getDrum('k'))
-		print('[i] Verschiedenes')
-		print(' |-- Bandreiniger %d%%' % self.getMisc('cleaner'))
-		print(' |-- Fixiereinheit %d%%' % self.getMisc('fuser')) 
-		print(' |-- Resttonbehälter %d%%' % self.getMisc('waste'))
-		print(' |-- Vorlageneinzugskit %d%%' % self.getMisc('transfer'))
-
-			
-	def getSnmp(self, oid):
-		'''
-			Macht SNMP Abfrage für angegebene OID
-		'''
-		# Check ob Drucker schon Timeouts hatte
-		if(self.name != -404):
-			ip = self.ip
-			port = self.port
-			community = self.community
-
-			cmdGen = cmdgen.CommandGenerator()
-			errorIndication, errorStatus, errorIndex, varBinds = cmdGen.getCmd(
-				#Notwendig für Ok-Drucker
-				#cmdgen.CommunityData(community, mpModel=0),
-				cmdgen.CommunityData(community),
-				cmdgen.UdpTransportTarget((ip, port)),
-				oid)
-
-		# Check for errors and print out results
-			if(errorIndication):
-				if(self.name == -401 and 'timeout' in str(errorIndication)):
-					writeLog('[ERROR] %s for %s' % (str(errorIndication), self.ip))
-					return -404
-				else:
-					writeLog('[ERROR] %s for %s' % (str(errorIndication), self.ip))
-					return -1
-			else:
-				if errorStatus:
-					writeLog('[ERROR] %s at %s' % (str(errorStatus), (errorIndex and varBinds[int(errorIndex)-1] or '?')))
-					return -1
-				else:
-					for name, val in varBinds:
-						#writeLog('%s = %s' % (name.prettywriteLog(), val.prettywriteLog()))
-						# Evaluiert, ob kein Wert an OID; kein Wert an OID = -1
-						if(val == '' or val == None or isinstance(val, rfc1905.NoSuchInstance) or isinstance(val, rfc1905.NoSuchObject)):
-							val = '-1'
-						val = str(val)
-						if(val.isdigit() or self.isNegative(val)):
-							return int(val)
-						return val
-		else:
-			return -404
-
-	@staticmethod
-	def isNegative(intTest):
-		'''
-			Helperfunction to evaluate if negative number is int
-			used in getSnmp to evaluate bad results
-		'''
-		try:
-			int(intTest)
-			return True
-		except ValueError:
-			return False
 
 class Xerox(Printer):
-	'''
-		Druckervariante normaler Xerox Drucker, der als Printer-
-		Referenzobjekt dient.
-	'''
-	pass
+    """ Druckervariante normaler Xerox Drucker,
+    der als Printer-Referenzobjekt dient. """
+    pass
+
+
+class XeroxC8130(Printer):
+    """ Druckervariante Xerox Altalink C8130 (unserer) """
+    # Resttonbehälter/Waste Cartridge
+    oid_waste_name = '1.3.6.1.2.1.43.11.1.1.6.1.9'
+    oid_waste_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.9'
+    oid_waste_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.9'
+    # Transferrolle/Transfer Roller
+    oid_transfer_name = '1.3.6.1.2.1.43.11.1.1.6.1.11'
+    oid_transfer_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.11'
+    oid_transfer_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.11'
+    # Bandreiniger/Transfer Belt Cleaner Kit
+    oid_cleaner_name = '1.3.6.1.2.1.43.11.1.1.6.1.10'
+    oid_cleaner_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.10'
+    oid_cleaner_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.10'
 
 
 class XeroxBW(Printer):
-	'''
-		Druckervariante Xerox Schwarzweiß
-	'''
-	oid_blackDrumType = '1.3.6.1.2.1.43.11.1.1.6.1.6'
-	oid_blackDrumRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.6'
-	oid_blackDrumCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.6'
-	oid_cyanDrumType = '1.3.6.1.2.1.43.11.1.1.6.1.5'
-	oid_cyanDrumRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.5'
-	oid_cyanDrumCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.5'
+
+    def initialize_values(self):
+        Printer.initialize_values(self)
+        consumables = []
+        # Append consumables in this list with a manually overwritten type
+        manual_consumables = [
+            PrinterConsumable.Consumable.FUSER
+        ]
+        remaining_status = lambda capacity, remaining: "1" if self.query_snmp(remaining) == "-3" and self.query_snmp(capacity) == "-2" else "0"
+
+        for manual_consumable in manual_consumables:
+            # check consumable has not been initialized automatically previously
+            if manual_consumable.value in [consumable.type for consumable in self.consumables]:
+                logger.warning(f'Manual Consumable {manual_consumable.value} initialization failed, because it was ' \
+                    'already added during the automatic routine')
+                continue
+
+            # initialize based on manual OID overwrites
+            capacity_oid = getattr(self, f'oid_{manual_consumable.value.lower()}_capacity_manual')
+            remaining_oid = getattr(self, f'oid_{manual_consumable.value.lower()}_remaining_manual')
+            name_oid = getattr(self, f'oid_{manual_consumable.value.lower()}_name_manual')
+            consumable = PrinterConsumable(
+                type=manual_consumable,
+                name=self.query_snmp(name_oid),
+                capacity="1",
+                remaining=remaining_status(capacity_oid, remaining_oid)
+            )
+            if consumable.initialized: self.consumables.append(consumable)
+
+    oid_printer_name = '1.3.6.1.2.1.1.1.0'
+
+    # Fixiereinheit/Fuser Kit
+    oid_fuser_name_manual = '1.3.6.1.2.1.43.11.1.1.6.1.40'
+    oid_fuser_capacity_manual =  '1.3.6.1.2.1.43.11.1.1.8.1.40'
+    oid_fuser_remaining_manual = '1.3.6.1.2.1.43.11.1.1.9.1.40'
+
+    oid_fuser_name = None
+    oid_fuser_capacity = None
+    oid_fuser_remaining = None
+    
+    """ Druckervariante Xerox Schwarzweiß """
+    oid_black_drum_name = '1.3.6.1.2.1.43.11.1.1.6.1.6'
+    oid_black_drum_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.6'
+    oid_black_drum_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.6'
+
+    # Resttonbehälter/Waste Cartridge
+    oid_waste_name = None
+    oid_waste_capacity = None
+    oid_waste_remaining = None
+
+    # Bandreiniger/Transfer Belt Cleaner Kit
+    oid_cleaner_name = None
+    oid_cleaner_capacity = None
+    oid_cleaner_remaining = None
+
+    # Transferrolle/Transfer Roller
+    oid_transfer_name = None
+    oid_transfer_capacity = None
+    oid_transfer_remaining = None
+
+    oid_cyan_toner_name = None
+    oid_cyan_toner_capacity = None
+    oid_cyan_toner_remaining = None
+
+    oid_magenta_toner_name = None
+    oid_magenta_toner_capacity = None
+    oid_magenta_toner_remaining = None
+
+    oid_yellow_toner_name = None
+    oid_yellow_toner_capacity = None
+    oid_yellow_toner_remaining = None
+
+    ## Bildtrommel ##########
+    oid_magenta_drum_name = None
+    oid_magenta_drum_capacity = None
+    oid_magenta_drum_remaining = None
+
+    oid_cyan_drum_name = None
+    oid_cyan_drum_capacity = None
+    oid_cyan_drum_remaining = None
+
+    oid_yellow_drum_name = None
+    oid_yellow_drum_capacity = None
+    oid_yellow_drum_remaining = None
 
 
 class XeroxWC3225(Printer):
-	'''
-		Druckervariante Xerox Schwarzweiß
-	'''
-	oid_blackDrumType = '1.3.6.1.2.1.43.11.1.1.6.1.2'
-	oid_blackDrumRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.2'
-	oid_blackDrumCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.2'
-	oid_cyanTonerType = '1.3.6.1.2.1.43.11.1.1.6.1.5'
-	oid_cyanTonerRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.5'
-	oid_cyanTonerCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.5'
+    """ Druckervariante Xerox WorkCentre 3225 """
+    oid_black_drum_name = '1.3.6.1.2.1.43.11.1.1.6.1.2'
+    oid_black_drum_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.2'
+    oid_black_drum_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.2'
+    oid_cyan_toner_name = '1.3.6.1.2.1.43.11.1.1.6.1.5'
+    oid_cyan_toner_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.5'
+    oid_cyan_toner_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.5'
+
+
+class XeroxVLB405(XeroxBW):
+    """ Druckervariante Xerox VersaLink B400 und B405 """
+    def initialize_values(self):
+        Printer.initialize_values(self)
+        consumables = []
+        # Append consumables in this list with a manually overwritten type
+        manual_consumables = [
+            PrinterConsumable.Consumable.CLEANER
+        ]
+        remaining_status = lambda capacity, remaining: "1" if self.query_snmp(remaining) == "-3" and self.query_snmp(capacity) == "-2" else "0"
+
+        for manual_consumable in manual_consumables:
+            # check consumable has not been initialized automatically previously
+            if manual_consumable.value in [consumable.type for consumable in self.consumables]:
+                logger.warning(f'Manual Consumable {manual_consumable.value} initialization failed, because it was ' \
+                    'already added during the automatic routine')
+                continue
+
+            # initialize based on manual OID overwrites
+            capacity_oid = getattr(self, f'oid_{manual_consumable.value.lower()}_capacity_manual')
+            remaining_oid = getattr(self, f'oid_{manual_consumable.value.lower()}_remaining_manual')
+            name_oid = getattr(self, f'oid_{manual_consumable.value.lower()}_name_manual')
+            consumable = PrinterConsumable(
+                type=manual_consumable,
+                name=self.query_snmp(name_oid),
+                capacity="1",
+                remaining=remaining_status(capacity_oid, remaining_oid)
+            )
+            if consumable.initialized: self.consumables.append(consumable)
+
+    # Wartungs Kit
+    oid_cleaner_name_manual = '1.3.6.1.2.1.43.11.1.1.6.1.40'
+    oid_cleaner_capacity_manual = '1.3.6.1.2.1.43.11.1.1.8.1.40'
+    oid_cleaner_remaining_manual = '1.3.6.1.2.1.43.11.1.1.9.1.40'
+
+
+class XeroxVLC405(Printer):
+    """ Druckervariante Xerox VersaLink C405 """
+    def initialize_values(self):
+        Printer.initialize_values(self)
+        consumables = []
+        # Append consumables in this list with a manually overwritten type
+        manual_consumables = [
+            PrinterConsumable.Consumable.FUSER,
+            PrinterConsumable.Consumable.CLEANER,
+            PrinterConsumable.Consumable.WASTE
+        ]
+        remaining_status = lambda capacity, remaining: "1" if self.query_snmp(remaining) == "-3" and self.query_snmp(capacity) == "-2" else "0"
+
+        for manual_consumable in manual_consumables:
+            # check consumable has not been initialized automatically previously
+            if manual_consumable.value in [consumable.type for consumable in self.consumables]:
+                logger.warning(f'Manual Consumable {manual_consumable.value} initialization failed, because it was ' \
+                    'already added during the automatic routine')
+                continue
+
+            # initialize based on manual OID overwrites
+            capacity_oid = getattr(self, f'oid_{manual_consumable.value.lower()}_capacity_manual')
+            remaining_oid = getattr(self, f'oid_{manual_consumable.value.lower()}_remaining_manual')
+            name_oid = getattr(self, f'oid_{manual_consumable.value.lower()}_name_manual')
+            consumable = PrinterConsumable(
+                type=manual_consumable,
+                name=self.query_snmp(name_oid),
+                capacity="1",
+                remaining=remaining_status(capacity_oid, remaining_oid)
+            )
+            if consumable.initialized: self.consumables.append(consumable)
+
+    oid_cyan_toner_name = '1.3.6.1.2.1.43.11.1.1.6.1.4'
+    oid_cyan_toner_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.4'
+    oid_cyan_toner_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.4'
+    oid_yellow_toner_name = '1.3.6.1.2.1.43.11.1.1.6.1.2'
+    oid_yellow_toner_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.2'
+    oid_yellow_toner_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.2'
+
+    # Fixiereinheit/Fuser Kit
+
+    oid_fuser_name_manual = '1.3.6.1.2.1.43.11.1.1.6.1.12'
+    oid_fuser_capacity_manual = '1.3.6.1.2.1.43.11.1.1.8.1.12'
+    oid_fuser_remaining_manual = '1.3.6.1.2.1.43.11.1.1.9.1.12'
+
+    oid_fuser_name = None
+    oid_fuser_capacity = None
+    oid_fuser_remaining = None
+
+    # Resttonbehälter/Waste Cartridge
+    oid_waste_name_manual = '1.3.6.1.2.1.43.11.1.1.6.1.5'
+    oid_waste_capacity_manual = '1.3.6.1.2.1.43.11.1.1.8.1.5'
+    oid_waste_remaining_manual = '1.3.6.1.2.1.43.11.1.1.9.1.5'
+
+    oid_waste_name = None
+    oid_waste_capacity = None
+    oid_waste_remaining = None
+
+    # Bandreiniger/Transfer Belt Cleaner Kit
+    oid_cleaner_name_manual = '1.3.6.1.2.1.43.11.1.1.6.1.39'
+    oid_cleaner_capacity_manual = '1.3.6.1.2.1.43.11.1.1.8.1.39'
+    oid_cleaner_remaining_manual = '1.3.6.1.2.1.43.11.1.1.9.1.39'
+
+    oid_cleaner_name = None
+    oid_cleaner_capacity = None
+    oid_cleaner_remaining = None
+
+    # Transferrolle/Transfer Roller
+    oid_transfer_name = None
+    oid_transfer_capacity = None
+    oid_transfer_remaining = None
+
+    ## Bildtrommel ##########
+    oid_black_drum_name = '1.3.6.1.2.1.43.11.1.1.6.1.41'
+    oid_black_drum_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.41'
+    oid_black_drum_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.41'
+
+    oid_cyan_drum_name = None
+    oid_cyan_drum_capacity = None
+    oid_cyan_drum_remaining = None
+
+    oid_magenta_drum_name = None
+    oid_magenta_drum_capacity = None
+    oid_magenta_drum_remaining = None
+
+    oid_yellow_drum_name = None
+    oid_yellow_drum_capacity = None
+    oid_yellow_drum_remaining = None
+
+
+class XeroxVLC505S(XeroxVLC405):
+    def initialize_values(self):
+        Printer.initialize_values(self)
+        consumables = []
+        # Append consumables in this list with a manually overwritten type
+        manual_consumables = [
+            PrinterConsumable.Consumable.FUSER,
+            PrinterConsumable.Consumable.CLEANER,
+            PrinterConsumable.Consumable.WASTE,
+            PrinterConsumable.Consumable.TRANSFER
+        ]
+        remaining_status = lambda capacity, remaining: "1" if self.query_snmp(remaining) == "-3" and self.query_snmp(capacity) == "-2" else "0"
+
+        for manual_consumable in manual_consumables:
+            # check consumable has not been initialized automatically previously
+            if manual_consumable.value in [consumable.type for consumable in self.consumables]:
+                logger.warning(f'Manual Consumable {manual_consumable.value} initialization failed, because it was ' \
+                    'already added during the automatic routine')
+                continue
+
+            # initialize based on manual OID overwrites
+            capacity_oid = getattr(self, f'oid_{manual_consumable.value.lower()}_capacity_manual')
+            remaining_oid = getattr(self, f'oid_{manual_consumable.value.lower()}_remaining_manual')
+            name_oid = getattr(self, f'oid_{manual_consumable.value.lower()}_name_manual')
+            consumable = PrinterConsumable(
+                type=manual_consumable,
+                name=self.query_snmp(name_oid),
+                capacity="1",
+                remaining=remaining_status(capacity_oid, remaining_oid)
+            )
+            if consumable.initialized: self.consumables.append(consumable)
+
+    # Einzugsrolle Behälter 1
+    oid_transfer_name = None
+    oid_transfer_capacity = None
+    oid_transfer_remaining = None
+
+    oid_transfer_name_manual = '1.3.6.1.2.1.43.11.1.1.6.1.18'
+    oid_transfer_capacity_manual = '1.3.6.1.2.1.43.11.1.1.8.1.18'
+    oid_transfer_remaining_manual = '1.3.6.1.2.1.43.11.1.1.9.1.18'
+
+
+    # Toner (swap cyan with yellow)
+    oid_cyan_toner_name = '1.3.6.1.2.1.43.11.1.1.6.1.4'
+    oid_cyan_toner_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.4'
+    oid_cyan_toner_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.4'
+
+    oid_yellow_toner_name = '1.3.6.1.2.1.43.11.1.1.6.1.2'
+    oid_yellow_toner_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.2'
+    oid_yellow_toner_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.2'
+
+    # Fixiereinheit/Fuser Kit
+
+    oid_fuser_name_manual = '1.3.6.1.2.1.43.11.1.1.6.1.12'
+    oid_fuser_capacity_manual = '1.3.6.1.2.1.43.11.1.1.8.1.12'
+    oid_fuser_remaining_manual = '1.3.6.1.2.1.43.11.1.1.9.1.12'
+
+    oid_fuser_name = None
+    oid_fuser_capacity = None
+    oid_fuser_remaining = None
+
+    # Sammelbehälter (Waste?)
+    oid_waste_name_manual = '1.3.6.1.2.1.43.11.1.1.6.1.5'
+    oid_waste_capacity_manual = '1.3.6.1.2.1.43.11.1.1.8.1.5'
+    oid_waste_remaining_manual = '1.3.6.1.2.1.43.11.1.1.9.1.5'
+
+    oid_waste_name = None
+    oid_waste_capacity = None
+    oid_waste_remaining = None
+
+    # Wartungskit
+    oid_cleaner_name_manual = '1.3.6.1.2.1.43.11.1.1.6.1.39'
+    oid_cleaner_capacity_manual = '1.3.6.1.2.1.43.11.1.1.8.1.39'
+    oid_cleaner_remaining_manual = '1.3.6.1.2.1.43.11.1.1.9.1.39'
+
+    oid_cleaner_name = None
+    oid_cleaner_capacity = None
+    oid_cleaner_remaining = None
+
+    ## Bildtrommel ##########
+    oid_black_drum_name = '1.3.6.1.2.1.43.11.1.1.6.1.6'
+    oid_black_drum_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.6'
+    oid_black_drum_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.6'
+
+    oid_yellow_drum_name = '1.3.6.1.2.1.43.11.1.1.6.1.7'
+    oid_yellow_drum_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.7'
+    oid_yellow_drum_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.7'
+
+    oid_magenta_drum_name = '1.3.6.1.2.1.43.11.1.1.6.1.8'
+    oid_magenta_drum_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.8'
+    oid_magenta_drum_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.8'
+
+    oid_cyan_drum_name = '1.3.6.1.2.1.43.11.1.1.6.1.9'
+    oid_cyan_drum_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.9'
+    oid_cyan_drum_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.9'
 
 
 class HP(Printer):
-	'''
-		Druckervariante regulärer HP LaserJet Color.
-	'''
-	oid_printerName = '1.3.6.1.2.1.43.5.1.1.16.1'
+    """ Druckervariante regulärer HP LaserJet Color. """
+    oid_printer_name = '1.3.6.1.2.1.43.5.1.1.16.1'
 
-	# Usage/Prints Details
-	oid_printsOverall = '1.3.6.1.4.1.11.2.3.9.4.2.1.1.16.1.9.0'
-	oid_printsColor = '1.3.6.1.4.1.11.2.3.9.4.2.1.1.16.1.10.0'
-	oid_printsMonochrome = '1.3.6.1.4.1.11.2.3.9.4.2.1.1.16.1.11.0'
+    # Usage/Prints Details
+    oid_print_count = '1.3.6.1.4.1.11.2.3.9.4.2.1.1.16.1.9.0'
+    oid_print_color = '1.3.6.1.4.1.11.2.3.9.4.2.1.1.16.1.10.0'
+    oid_print_mono = '1.3.6.1.4.1.11.2.3.9.4.2.1.1.16.1.11.0'
 
 
-class HPBW(HP): 
-	# Bildtransferkit
-	oid_fuserType = '1.3.6.1.2.1.43.11.1.1.6.1.2'
-	oid_fuserCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.2'
-	oid_fuserRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.2'
+class HPBW(Printer):
 
-	## damit der Rest -1 zurückgibt...
-	oid_printsColor = '1.3.6.1'
-	oid_cyanTonerType = '1.3.6.1'
-	oid_cyanTonerCapacity = '1.3.6.1'
-	oid_cyanTonerRemaining = '1.3.6.1'
-	
-	oid_magentaTonerType = '1.3.6.1'
-	oid_magentaTonerCapacity = '1.3.6.1'
-	oid_magentaTonerRemaining = '1.3.6.1'
+    # Usage/Prints Details
+    oid_print_count = '1.3.6.1.4.1.11.2.3.9.4.2.1.1.16.1.9.0'
 
-	oid_yellowTonerType = '1.3.6.1'
-	oid_yellowTonerCapacity = '1.3.6.1'
-	oid_yellowTonerRemaining = '1.3.6.1'
+    # Fixiereinheit/Fuser Kit
+    oid_fuser_name = '1.3.6.1.2.1.43.11.1.1.6.1.2'
+    oid_fuser_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.2'
+    oid_fuser_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.2'
 
-	## Bildtrommel ##########
-	oid_blackDrumType = '1.3.6.1'
-	oid_blackDrumCapacity = '1.3.6.1'
-	oid_blackDrumRemaining = '1.3.6.1'
+    ## damit der Rest -1 zurückgibt...
+    oid_print_color = None
+    oid_cyan_toner_name = None
+    oid_cyan_toner_capacity = None
+    oid_cyan_toner_remaining = None
 
-	oid_cyanDrumType = '1.3.6.1'
-	oid_cyanDrumCapacity = '1.3.6.1'
-	oid_cyanDrumRemaining = '1.3.6.1'
-	
-	oid_magentaDrumType = '1.3.6.1'
-	oid_magentaDrumCapacity = '1.3.6.1'
-	oid_magentaDrumRemaining = '1.3.6.1'
-	
-	oid_yellowDrumType = '1.3.6.1'
-	oid_yellowDrumCapacity = '1.3.6.1'
-	oid_yellowDrumRemaining = '1.3.6.1'
+    oid_magenta_toner_name = None
+    oid_magenta_toner_capacity = None
+    oid_magenta_toner_remaining = None
 
-	def initializeValues(self):
-		Printer.initializeValues(self)
-		self.fuserRemaining = round(((int(self.fuserRemaining) / int(self.fuserCapacity)) * 100))
+    oid_yellow_toner_name = None
+    oid_yellow_toner_capacity = None
+    oid_yellow_toner_remaining = None
 
+    ## Bildtrommel ##########
+    oid_black_drum_name = None
+    oid_black_drum_capacity = None
+    oid_black_drum_remaining = None
+
+    oid_cyan_drum_name = None
+    oid_cyan_drum_capacity = None
+    oid_cyan_drum_remaining = None
+
+    oid_magenta_drum_name = None
+    oid_magenta_drum_capacity = None
+    oid_magenta_drum_remaining = None
+
+    oid_yellow_drum_name = None
+    oid_yellow_drum_capacity = None
+    oid_yellow_drum_remaining = None
 
 
 class HPMFP(HP):
-	oid_printsOverall = '1.3.6.1.2.1.43.10.2.1.4.1.1'
-	oid_printsMonochrome = '1.3.6.1.2.1.43.10.2.1.4.1.1'
+    oid_print_count = '1.3.6.1.2.1.43.10.2.1.4.1.1'
+    oid_print_mono = '1.3.6.1.2.1.43.10.2.1.4.1.1'
+
+
+class HPM426(HP):
+    """ HP LJ MFP M426 """
+    oid_print_count = '1.3.6.1.2.1.43.10.2.1.4.1.1'
+    oid_print_color = None
+    oid_print_mono = '1.3.6.1.2.1.43.10.2.1.4.1.1'
+
+    # Fixiereinheit/Fuser Kit
+    oid_fuser_name = None
+    oid_fuser_capacity = None
+    oid_fuser_remaining = None
+
+    # Resttonbehälter/Waste Cartridge
+    oid_waste_name = None
+    oid_waste_capacity = None
+    oid_waste_remaining = None
+
+    # Bandreiniger/Transfer Belt Cleaner Kit
+    oid_cleaner_name = None
+    oid_cleaner_capacity = None
+    oid_cleaner_remaining = None
+
+    # Transferrolle/Transfer Roller
+    oid_transfer_name = None
+    oid_transfer_capacity = None
+    oid_transfer_remaining = None
+
+    ## Toner ##########
+    oid_black_toner_name = '1.3.6.1.2.1.43.11.1.1.6.1.1'
+    oid_black_toner_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.1'
+    oid_black_toner_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.1'
+
+    oid_cyan_toner_name = None
+    oid_cyan_toner_capacity = None
+    oid_cyan_toner_remaining = None
+
+    oid_magenta_toner_name = None
+    oid_magenta_toner_capacity = None
+    oid_magenta_toner_remaining = None
+
+    oid_yellow_toner_name = None
+    oid_yellow_toner_capacity = None
+    oid_yellow_toner_remaining = None
+
+    ## Bildtrommel ##########
+    oid_black_drum_name = None
+    oid_black_drum_capacity = None
+    oid_black_drum_remaining = None
+
+    oid_cyan_drum_name = None
+    oid_cyan_drum_capacity = None
+    oid_cyan_drum_remaining = None
+
+    oid_magenta_drum_name = None
+    oid_magenta_drum_capacity = None
+    oid_magenta_drum_remaining = None
+
+    oid_yellow_drum_name = None
+    oid_yellow_drum_capacity = None
+    oid_yellow_drum_remaining = None
 
 
 class KCSW(Printer):
     # Kyocera spezifisch Overall Prints
-	oid_printsOverall = '1.3.6.1.4.1.1347.42.2.1.1.1.6.1.1'
-	oid_printsMonochrome = '1.3.6.1.4.1.1347.42.2.1.1.1.6.1.1'
+    oid_print_count = '1.3.6.1.4.1.1347.42.2.1.1.1.6.1.1'
+    oid_print_mono = '1.3.6.1.4.1.1347.42.2.1.1.1.6.1.1'
 
-	## damit der Rest -1 zurückgibt...
-	oid_printsColor = '1.3.6.1'
-	oid_cyanTonerType = '1.3.6.1'
-	oid_cyanTonerCapacity = '1.3.6.1'
-	oid_cyanTonerRemaining = '1.3.6.1'
-	
-	oid_magentaTonerType = '1.3.6.1'
-	oid_magentaTonerCapacity = '1.3.6.1'
-	oid_magentaTonerRemaining = '1.3.6.1'
+    ## damit der Rest -1 zurückgibt...
+    oid_print_color = '1.3.6.1'
+    oid_cyan_toner_name = '1.3.6.1'
+    oid_cyan_toner_capacity = '1.3.6.1'
+    oid_cyan_toner_remaining = '1.3.6.1'
 
-	oid_yellowTonerType = '1.3.6.1'
-	oid_yellowTonerCapacity = '1.3.6.1'
-	oid_yellowTonerRemaining = '1.3.6.1'
+    oid_magenta_toner_name = '1.3.6.1'
+    oid_magenta_toner_capacity = '1.3.6.1'
+    oid_magenta_toner_remaining = '1.3.6.1'
 
-	## Bildtrommel ##########
-	oid_blackDrumType = '1.3.6.1'
-	oid_blackDrumCapacity = '1.3.6.1'
-	oid_blackDrumRemaining = '1.3.6.1'
+    oid_yellow_toner_name = '1.3.6.1'
+    oid_yellow_toner_capacity = '1.3.6.1'
+    oid_yellow_toner_remaining = '1.3.6.1'
 
-	oid_cyanDrumType = '1.3.6.1'
-	oid_cyanDrumCapacity = '1.3.6.1'
-	oid_cyanDrumRemaining = '1.3.6.1'
-	
-	oid_magentaDrumType = '1.3.6.1'
-	oid_magentaDrumCapacity = '1.3.6.1'
-	oid_magentaDrumRemaining = '1.3.6.1'
-	
-	oid_yellowDrumType = '1.3.6.1'
-	oid_yellowDrumCapacity = '1.3.6.1'
-	oid_yellowDrumRemaining = '1.3.6.1'
+    ## Bildtrommel ##########
+    oid_black_drum_name = '1.3.6.1'
+    oid_black_drum_capacity = '1.3.6.1'
+    oid_black_drum_remaining = '1.3.6.1'
 
-	# Bandreiniger auf -1
-	oid_cleanerType = '1.3.6.1'
-	oid_cleanerCapacity = '1.3.6.1'
-	oid_cleanerRemaining = '1.3.6.1'
+    oid_cyan_drum_name = '1.3.6.1'
+    oid_cyan_drum_capacity = '1.3.6.1'
+    oid_cyan_drum_remaining = '1.3.6.1'
+
+    oid_magenta_drum_name = '1.3.6.1'
+    oid_magenta_drum_capacity = '1.3.6.1'
+    oid_magenta_drum_remaining = '1.3.6.1'
+
+    oid_yellow_drum_name = '1.3.6.1'
+    oid_yellow_drum_capacity = '1.3.6.1'
+    oid_yellow_drum_remaining = '1.3.6.1'
+
+    # Bandreiniger auf -1
+    oid_cleaner_name = '1.3.6.1'
+    oid_cleaner_capacity = '1.3.6.1'
+    oid_cleaner_remaining = '1.3.6.1'
 
 
 class DICL(Printer):
-	# Usage/Prints Details
-	oid_printsOverall = '1.3.6.1.2.1.43.10.2.1.4.1.1'
-	oid_printsColor = '1.3.6.1.4.1.18334.1.1.1.5.7.2.2.1.5.2.2'
-	oid_printsMonochrome = '1.3.6.1.4.1.18334.1.1.1.5.7.2.2.1.5.1.2'
+    # Develop Ineo 450 / äquivalente Kyocera Produkte
 
-	# colorOverall = copiesColor + printsColor - specific to DICL
-	oid_copiesColor = '1.3.6.1.4.1.18334.1.1.1.5.7.2.2.1.5.2.1'
-	oid_copiesMonochrome = '1.3.6.1.4.1.18334.1.1.1.5.7.2.2.1.5.1.1'
+    def initialize_values(self):
+        Printer.initialize_values(self)
+        consumables = []
+        # Append consumables in this list with a manually overwritten type
+        manual_consumables = [
+            PrinterConsumable.Consumable.WASTE
+        ]
+        remaining_status = lambda capacity, remaining: "1" if self.query_snmp(remaining) == "-3" and self.query_snmp(capacity) == "-2" else "0"
 
-	# Toner 
-	oid_blackTonerType = '1.3.6.1.2.1.43.11.1.1.6.1.4'
-	oid_blackTonerCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.4'
-	oid_blackTonerRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.4'
+        for manual_consumable in manual_consumables:
+            # check consumable has not been initialized automatically previously
+            if manual_consumable.value in [consumable.type for consumable in self.consumables]:
+                logger.warning(f'Manual Consumable {manual_consumable.value} initialization failed, because it was ' \
+                    'already added during the automatic routine')
+                continue
 
-	oid_cyanTonerType = '1.3.6.1.2.1.43.11.1.1.6.1.1'
-	oid_cyanTonerCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.1'
-	oid_cyanTonerRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.1'
-	
-	oid_magentaTonerType = '1.3.6.1.2.1.43.11.1.1.6.1.2'
-	oid_magentaTonerCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.2'
-	oid_magentaTonerRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.2'
+            # initialize based on manual OID overwrites
+            capacity_oid = getattr(self, f'oid_{manual_consumable.value.lower()}_capacity_manual')
+            remaining_oid = getattr(self, f'oid_{manual_consumable.value.lower()}_remaining_manual')
+            name_oid = getattr(self, f'oid_{manual_consumable.value.lower()}_name_manual')
+            consumable = PrinterConsumable(
+                type=manual_consumable,
+                name=self.query_snmp(name_oid),
+                capacity="1",
+                remaining=remaining_status(capacity_oid, remaining_oid)
+            )
+            if consumable.initialized: self.consumables.append(consumable)
+        
+        if self.print_color is None: return  # if not initialized casting None to int below will raise an error
+        self.print_color = int(self.print_color) + int(self.query_snmp(self.oid_copies_color))
+        self.print_mono = int(self.print_mono) + int(self.query_snmp(self.oid_copies_monochrome))
 
-	oid_yellowTonerType = '1.3.6.1.2.1.43.11.1.1.6.1.3'
-	oid_yellowTonerCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.3'
-	oid_yellowTonerRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.3'
-    
+    oid_printer_name = '1.3.6.1.2.1.1.1.0'
+
+    # Sammelbehälter (Waste?)
+    oid_waste_name_manual = '1.3.6.1.2.1.43.11.1.1.6.1.13'
+    oid_waste_capacity_manual = '1.3.6.1.2.1.43.11.1.1.8.1.13'
+    oid_waste_remaining_manual = '1.3.6.1.2.1.43.11.1.1.9.1.13'
+
+    oid_waste_name = None
+    oid_waste_capacity = None
+    oid_waste_remaining = None
+
+    # Transfer roller
+    oid_cleaner_name = '1.3.6.1.2.1.43.11.1.1.6.1.16'
+    oid_cleaner_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.16'
+    oid_cleaner_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.16'
+
+    # Usage/Prints Details
+    oid_print_count = '1.3.6.1.2.1.43.10.2.1.4.1.1'
+    oid_print_color = '1.3.6.1.4.1.18334.1.1.1.5.7.2.2.1.5.2.2'
+    oid_print_mono = '1.3.6.1.4.1.18334.1.1.1.5.7.2.2.1.5.1.2'
+
+    # colorOverall = copiesColor + print_color - specific to DICL
+    oid_copies_color = '1.3.6.1.4.1.18334.1.1.1.5.7.2.2.1.5.2.1'
+    oid_copies_monochrome = '1.3.6.1.4.1.18334.1.1.1.5.7.2.2.1.5.1.1'
+
+    # Toner
+    oid_black_toner_name = '1.3.6.1.2.1.43.11.1.1.6.1.4'
+    oid_black_toner_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.4'
+    oid_black_toner_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.4'
+
+    oid_cyan_toner_name = '1.3.6.1.2.1.43.11.1.1.6.1.1'
+    oid_cyan_toner_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.1'
+    oid_cyan_toner_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.1'
+
+    oid_magenta_toner_name = '1.3.6.1.2.1.43.11.1.1.6.1.2'
+    oid_magenta_toner_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.2'
+    oid_magenta_toner_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.2'
+
+    oid_yellow_toner_name = '1.3.6.1.2.1.43.11.1.1.6.1.3'
+    oid_yellow_toner_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.3'
+    oid_yellow_toner_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.3'
+
     # Bildtrommel
-	oid_blackDrumType = '1.3.6.1.2.1.43.11.1.1.6.1.11'
-	oid_blackDrumCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.11'
-	oid_blackDrumRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.11'
+    oid_black_drum_name = '1.3.6.1.2.1.43.11.1.1.6.1.11'
+    oid_black_drum_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.11'
+    oid_black_drum_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.11'
 
-	oid_cyanDrumType = '1.3.6.1.2.1.43.11.1.1.6.1.5'
-	oid_cyanDrumCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.5'
-	oid_cyanDrumRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.5'
-	
-	oid_magentaDrumType = '1.3.6.1.2.1.43.11.1.1.6.1.7'
-	oid_magentaDrumCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.7'
-	oid_magentaDrumRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.7'
-	
-	oid_yellowDrumType = '1.3.6.1.2.1.43.11.1.1.6.1.9'
-	oid_yellowDrumCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.9'
-	oid_yellowDrumRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.9'
-    
-	# Bildtransferkit
-	oid_fuserType = '1.3.6.1.2.1.43.11.1.1.6.1.14'
-	oid_fuserCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.14'
-	oid_fuserRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.14'
-    
-	# Vorlageneinzugskit
-	oid_transferType = '1.3.6.1.2.1.43.11.1.1.6.1.15'
-	oid_transferCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.15'
-	oid_transferRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.15'
+    oid_cyan_drum_name = '1.3.6.1.2.1.43.11.1.1.6.1.5'
+    oid_cyan_drum_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.5'
+    oid_cyan_drum_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.5'
 
-	# Resttonbehälter
-	oid_wasteType = '1.3.6.1'
-	oid_wasteCapacity = '1.3.6.1'
-	oid_wasteRemaining = '1.3.6.1'
-	
-	# Walzenkit
-	oid_cleanerType = '1.3.6.1'
-	oid_cleanerCapacity = '1.3.6.1'
-	oid_cleanerRemaining = '1.3.6.1'
-	
-	def initializeValues(self):
-		Printer.initializeValues(self)
-		#self.printsOverall = self.printsOverall + self.getSnmp(self.oid_copiesOverall)
-		self.printsColor = int(self.printsColor) + int(self.getSnmp(self.oid_copiesColor))
-		self.printsMonochrome = int(self.printsMonochrome) + int(self.getSnmp(self.oid_copiesMonochrome))
+    oid_magenta_drum_name = '1.3.6.1.2.1.43.11.1.1.6.1.7'
+    oid_magenta_drum_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.7'
+    oid_magenta_drum_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.7'
+
+    oid_yellow_drum_name = '1.3.6.1.2.1.43.11.1.1.6.1.9'
+    oid_yellow_drum_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.9'
+    oid_yellow_drum_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.9'
+
+    # Fixiereinheit/Fuser Kit
+    oid_fuser_name = '1.3.6.1.2.1.43.11.1.1.6.1.14'
+    oid_fuser_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.14'
+    oid_fuser_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.14'
+
+    # Transferrolle/Transfer Roller
+    oid_transfer_name = '1.3.6.1.2.1.43.11.1.1.6.1.15'
+    oid_transfer_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.15'
+    oid_transfer_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.15'
+
+    #def initialize_values(self):
+        #Printer.initialize_values(self)
+        #if self.print_color is None: return  # if not initialized casting None to int below will raise an error
+        #self.print_color = int(self.print_color) + int(self.query_snmp(self.oid_copies_color))
+        #self.print_mono = int(self.print_mono) + int(self.query_snmp(self.oid_copies_monochrome))
 
 
 class HPM725BW(HPBW):
     # Skrip Eintrag 'Bandreiniger' ist bei diesem Modell 'Wartungskit'
     # Bandreiniger auf -1
-	oid_cleanerType = '1.3.6.1'
-	oid_cleanerCapacity = '1.3.6.1'
-	oid_cleanerRemaining = '1.3.6.1'
+    oid_cleaner_name = '1.3.6.1'
+    oid_cleaner_capacity = '1.3.6.1'
+    oid_cleaner_remaining = '1.3.6.1'
 
 
-class OKI(Printer):
-	# Usage/Prints Details
-	oid_printsOverall = '1.3.6.1'
-	# generelle oid overall erzeugt ungenaue werte
-	oid_printsColor = '1.3.6.1.4.1.2001.1.1.1.1.11.1.10.170.1.6.1'
-	oid_printsMonochrome = '1.3.6.1.4.1.2001.1.1.1.1.11.1.10.170.1.7.1'
-	
-	# Bildtransferkit
-	oid_fuserType = '1.3.6.1.2.1.43.11.1.1.6.1.10'
-	oid_fuserCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.10'
-	oid_fuserRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.10'
-	
-	# Resttonbehälter ist hier oid für Transferband
-	oid_transferType = '1.3.6.1.2.1.43.11.1.1.6.1.9'
-	oid_transferCapacity = '1.3.6.1.2.1.43.11.1.1.8.1.9'
-	oid_transferRemaining = '1.3.6.1.2.1.43.11.1.1.9.1.9'
-	
-	# Resttonbehälter
-	oid_wasteType = '1.3.6.1'
-	oid_wasteCapacity = '1.3.6.1'
-	oid_wasteRemaining = '1.3.6.1'
-	
-	# Walzenkit
-	oid_cleanerType = '1.3.6.1'
-	oid_cleanerCapacity = '1.3.6.1'
-	oid_cleanerRemaining = '1.3.6.1'
+class XeroxPhaser(Printer):
+    """ erstellt für Durckervariante Xerox Phaser 7760 """
+
+    # Fixiereinheit/Fuser Kit
+    oid_fuser_name = '1.3.6.1.2.1.43.11.1.1.6.1.6'
+    oid_fuser_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.6'
+    oid_fuser_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.6'
+
+    # Resttonbehälter/Waste Cartridge
+    oid_waste_name = '1.3.6.1.2.1.43.11.1.1.6.1.7'
+    oid_waste_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.7'
+    oid_waste_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.7'
+
+    # Bandreiniger/Transfer Belt Cleaner Kit
+    oid_cleaner_name = '1.3.6.1.2.1.43.11.1.1.6.1.13'
+    oid_cleaner_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.13'
+    oid_cleaner_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.13'
+
+    # Transferrolle/Transfer Roller
+    oid_transfer_name = '1.3.6.1.2.1.43.11.1.1.6.1.5'
+    oid_transfer_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.5'
+    oid_transfer_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.5'
+
+    ## Toner ##########
+    oid_cyan_toner_name = '1.3.6.1.2.1.43.11.1.1.6.1.1'
+    oid_cyan_toner_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.1'
+    oid_cyan_toner_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.1'
+
+    oid_magenta_toner_name = '1.3.6.1.2.1.43.11.1.1.6.1.2'
+    oid_magenta_toner_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.2'
+    oid_magenta_toner_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.2'
+
+    oid_yellow_toner_name = '1.3.6.1.2.1.43.11.1.1.6.1.3'
+    oid_yellow_toner_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.3'
+    oid_yellow_toner_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.3'
+
+    oid_black_toner_name = '1.3.6.1.2.1.43.11.1.1.6.1.4'
+    oid_black_toner_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.4'
+    oid_black_toner_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.4'
+
+    ## Bildtrommel ##########
+    oid_black_drum_name = '1.3.6.1.2.1.43.11.1.1.6.1.11'
+    oid_black_drum_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.11'
+    oid_black_drum_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.11'
+
+    oid_cyan_drum_name = '1.3.6.1.2.1.43.11.1.1.6.1.8'
+    oid_cyan_drum_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.8'
+    oid_cyan_drum_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.8'
+
+    oid_magenta_drum_name = '1.3.6.1.2.1.43.11.1.1.6.1.9'
+    oid_magenta_drum_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.9'
+    oid_magenta_drum_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.9'
+
+    oid_yellow_drum_name = '1.3.6.1.2.1.43.11.1.1.6.1.10'
+    oid_yellow_drum_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.10'
+    oid_yellow_drum_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.10'
 
 
-def writeLog(logString):
-	print(logString)
-	with open(LOGFILE, 'a') as f:
-		f.write(('%s - %s\n' % (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), logString)))
-	f.close()
+class oki(Printer):
+    # Usage/Prints Details
+    oid_print_count = '1.3.6.1.4.1.2001.1.1.1.1.11.1.10.150.1.6.102'
+    oid_print_color = '1.3.6.1.4.1.2001.1.1.1.1.11.1.10.170.1.6.1'
+    oid_print_mono = '1.3.6.1.4.1.2001.1.1.1.1.11.1.10.170.1.7.1'
+
+    # Fixiereinheit/Fuser Kit
+    oid_fuser_name = '1.3.6.1.2.1.43.11.1.1.6.1.10'
+    oid_fuser_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.10'
+    oid_fuser_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.10'
+
+    # Resttonbehälter/Waste Cartridge ist hier oid für Transferband
+    oid_transfer_name = '1.3.6.1.2.1.43.11.1.1.6.1.9'
+    oid_transfer_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.9'
+    oid_transfer_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.9'
+
+    # Resttonbehälter/Waste Cartridge
+    oid_waste_name = '1.3.6.1'
+    oid_waste_capacity = '1.3.6.1'
+    oid_waste_remaining = '1.3.6.1'
+
+    # Bandreiniger/Transfer Belt Cleaner Kit
+    oid_cleaner_name = '1.3.6.1'
+    oid_cleaner_capacity = '1.3.6.1'
+    oid_cleaner_remaining = '1.3.6.1'
 
 
-# sends data to backend
-def reportData(printer):
-	sslVerify = True
-	r = requests.post(BACKEND, proxies=PROXIES, headers=HEADERS, json=printer.__dict__, verify=sslVerify)
-	
-	if(r.status_code != 200):
-		writeLog('[ERROR] Could not report data for %s [%s] to backend | %d' % (printer.desc, printer.serial, r.status_code))
-		return
-	writeLog('[>] Reporting data for %s [%s] to backend | %d' % (printer.desc, printer.serial, r.status_code))
-	return r.text
+class okiC911(Printer):
+	# Resttonbehälter/Waste Cartridge
+    oid_waste_name = '1.3.6.1.2.1.43.11.1.1.6.1.11'
+    oid_waste_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.11'
+    oid_waste_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.11'
+
+    # Fixiereinheit/Fuser Kit
+    oid_fuser_name = '1.3.6.1.2.1.43.11.1.1.6.1.10'
+    oid_fuser_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.10'
+    oid_fuser_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.10'
+
+    # Übertragungsband/Transfer Belt
+    oid_transfer_name = '1.3.6.1.2.1.43.11.1.1.6.1.9'
+    oid_transfer_capacity = '1.3.6.1.2.1.43.11.1.1.8.1.9'
+    oid_transfer_remaining = '1.3.6.1.2.1.43.11.1.1.9.1.9'
+
+    oid_cleaner_name = None
+    oid_cleaner_capacity = None
+    oid_cleaner_remaining = None
 
 
-def decidePrinter(ip, variant, desc, kunde):
-	'''
-	Gibt das entsprechende Printer Objekt für einen
-	Drucker <variant> zurück.
-	'''
-	variant = variant.lower()
-	if(variant == 'xerox'):
-		return Xerox(ip, variant, desc, kunde)
-	elif(variant == 'xeroxbw'):
-		return XeroxBW(ip, variant, desc, kunde)
-	elif(variant == 'hp'):
-		return HP(ip, variant, desc, kunde)
-	elif(variant == 'hpbw'):
-		return HPBW(ip, variant, desc, kunde)
-	elif(variant == 'hpmfp'):
-		return HPMFP(ip, variant, desc, kunde)
-	elif(variant == 'kcsw'):
-		return KCSW(ip, variant, desc, kunde)
-	elif(variant == 'dicl'):
-		return DICL(ip, variant, desc, kunde)
-	elif(variant == 'hpm725bw'):
-		return HPM725BW(ip, variant, desc, kunde)
-	elif(variant == 'xeroxwc3225'):
-		return XeroxWC3225(ip, variant, desc, kunde)
-	writeLog('[INFO] Ungültige Variante: "%s" für Drucker mit IP: %s' % (variant, ip))
-	return Printer(ip, variant, desc, kunde)
+def report_data(printer: Printer) -> None:
+    """ Report Printer to Backend """
+    data = printer.to_json()
+    data.setdefault('timestamp', datetime.now(timezone.utc).isoformat())
+    logger.info(data)
+    r = requests.post(BACKEND, proxies=PROXIES, headers=HEADERS, json=data, verify=True)
+
+    if(r.status_code == 201):
+        logger.info(f'[>] Reporting data for {printer.description} [{printer.serial}] to backend | {r.status_code}')
+        return
+
+    logger.error(f'Could not report data for {printer.description} [{printer.serial}] to backend | {r.status_code}')
+    logger.debug(r.text)
 
 
+def decide_printer(*args, **kwargs):
+    """ Gibt das entsprechende Printer Objekt für
+    einen Drucker <variant> zurück. """
+    variant = kwargs.get('variant').lower()
+    if(variant == 'xerox'): return Xerox(**kwargs)
+    elif(variant == 'xeroxbw'): return XeroxBW(**kwargs)
+    elif(variant == 'hp'): return HP(**kwargs)
+    elif(variant == 'hpbw'): return HPBW(**kwargs)
+    elif(variant == 'hpmfp'): return HPMFP(**kwargs)
+    elif(variant == 'hpm426'): return HPM426(**kwargs)
+    elif(variant == 'kcsw'): return KCSW(**kwargs)
+    elif(variant == 'dicl'): return DICL(**kwargs)
+    elif(variant == 'hpm725bw'): return HPM725BW(**kwargs)
+    elif(variant == 'xeroxc8130'): return XeroxC8130(**kwargs)
+    elif(variant == 'xeroxwc3225'): return XeroxWC3225(**kwargs)
+    elif(variant == 'xeroxphaser'): return XeroxPhaser(**kwargs)
+    elif(variant == 'xeroxvlc405'): return XeroxVLC405(**kwargs)
+    elif(variant == 'xeroxvlc505s'): return XeroxVLC505S(**kwargs)
+    elif(variant == 'xeroxvlb405'): return XeroxVLB405(**kwargs)
+    elif(variant == 'oki'): return oki(**kwargs)
+    elif(variant == 'okiC911'): return okiC911(**kwargs)
+    logger.warning(f'Ungültige Variante: "{variant}" für Drucker mit IP: {kwargs.get("ip")}')
+    return Printer(**kwargs)
 
-def initializePrinters():
-	'''
-	Hilfsfunktion die über Config iteriert und alle
-	Drucker initialisiert zurückgibt
-	'''
-	global PROXIES
-	with open('printer_config.txt') as f:
-		data = json.loads(f.read())
 
-	PROXIES = {'http':data['proxy'], 'https':data['proxy']}
-	printers = []
-	for printer in data['drucker']:
-			printers.append(decidePrinter(printer['ip'], printer['variant'], printer['desc'], data['kunde']))
-	return printers
+def print_status(printer: Printer) -> None:
+    print(f'########## Report for {printer.description} ##########')
+    print('[i] Printer Overview')
+    print(f' |-- Name: {printer.name}')
+    print(f' |-- Model: {printer.model}')
+    print(f' |-- IP address: {printer.ip}')
+    print(f' |-- Serial number: {printer.serial}')
+    print(f' |-- Client: {printer.kunde}')
+    print(f' |-- Description: {printer.description}')
+    print(f'[i] Printer statistics')
+    print(f' |-- Mono: {int(printer.print_mono or 0):,}')
+    print(f' |-- Color: {int(printer.print_color or 0):,}')
+    print(f' |-- Total: {int(printer.print_count or 0):,}')
+    print(f'[i] Toner values (TONER)')
+    print(f' |-- [C] {printer.get_consumable("CYAN_TONER")}')
+    print(f' |-- [M] {printer.get_consumable("MAGENTA_TONER")}')
+    print(f' |-- [Y] {printer.get_consumable("YELLOW_TONER")}')
+    print(f' |-- [K] {printer.get_consumable("BLACK_TONER")}')
+    print(f'[i] Drum values (DRUM)')
+    print(f' |-- [C] {printer.get_consumable("CYAN_DRUM")}')
+    print(f' |-- [M] {printer.get_consumable("MAGENTA_DRUM")}')
+    print(f' |-- [Y] {printer.get_consumable("YELLOW_DRUM")}')
+    print(f' |-- [K] {printer.get_consumable("BLACK_DRUM")}')
+    print(f'[i] Misc')
+    print(f' |-- CLEANER {printer.get_consumable("CLEANER")}')
+    print(f' |-- FUSER {printer.get_consumable("FUSER")}')
+    print(f' |-- WASTE {printer.get_consumable("WASTE")}')
+    print(f' |-- TRANSFER {printer.get_consumable("TRANSFER")}')
 
 
-########### E I N S T I E G S F U N K T I O N ############################
+def initialize_printers() -> list:
+    """ Hilfsfunktion die über Config iteriert und alle
+    Drucker initialisiert zurückgibt """
+    global PROXIES
+    global HEADERS
+    with open('printer_config.txt') as f:
+        data = json.loads(f.read())
+
+    PROXIES = {'http': data.get('proxy') or '', 'https': data.get('proxy') or ''}
+    HEADERS.setdefault('Authorization', f'Token {data.get("token")}')
+
+    printers = []
+    for printer in data['printers']:
+        printers.append(decide_printer(
+            kunde=data['client'],
+            ip=printer['ip'],
+            serial=printer['serial'],
+            description=printer['description'],
+            variant=printer['variant']
+        ))
+    return printers
+
 
 if __name__ == '__main__':
-	os.chdir(os.path.realpath(os.path.join(os.getcwd(), os.path.dirname(__file__))))
-	writeLog('##################################################')
-	writeLog('[>] SNMP Printer Monitoring and Reporting, alfonsrv x 2020')
-	if(len(sys.argv) > 1):
-		try:
-			printers = initializePrinters()
-			if(sys.argv[1].lower() == 'report'):
-				for printer in printers:
-					printer.initializeValues()
-					writeLog(printer.__dict__)
-					reportData(printer)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--report', help='Report raw printer data to backend', action='store_true')
+    parser.add_argument('--debug', help='Verbose debug output, no reporting', action='store_true')
+    parser.add_argument('--ping', help='Check printer alive status, no reporting', action='store_true')
+    args = parser.parse_args()
+    if not any(vars(args).values()): parser.error('No arguments provided.')
 
-			elif(sys.argv[1].lower() == 'debug'):
-				for printer in printers:
-					printer.ping()
-					printer.initializeValues()
-					printer.printStatus()
-					print(printer.__dict__)
-					print('#########################################################')
+    logger.info('##################################################')
+    logger.info(f'[>] RAUSYS SNMP Printer Monitoring and Reporting, v{__version__}')
+    logger.info(f'[>] Innovative Managed Services and IT partner: rausys.de')
 
-			elif(sys.argv[1].lower() == 'ping'):
-				for printer in printers:
-					printer.ping()
-		except Exception as e:
-			writeLog('[ERROR]: %s' % str(e))
-			writeLog(traceback.format_exc())
-			exit()
+    printers = initialize_printers()
+    for printer in printers:
+        if args.report:
+            if printer.status == 'OK':
+                printer.initialize_values()
+            report_data(printer)
+        elif args.debug:
+            printer.ping()
+            printer.initialize_values()
+            print_status(printer)
 
-	else:
-		print('')
-		print('Aborting. No arguments were supplied.')
-		print('Usage: printer-monitoring.py <parameter>')
-		print('- report	- Report raw printer data')
-		print('- debug		- Verbose debug output, no reporting')
-		print('- ping		- Check printer alive status, no reporting')
+            print(printer.to_json())
+            print('#########################################################')
+        elif args.ping:
+            printer.ping()
+
+#a = Printer('10.100.20.110', 'Xerox', 'Beispielbeschreibung', 'Beispielkunde')
+#a.printStatus()
